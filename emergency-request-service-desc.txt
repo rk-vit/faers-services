@@ -1,0 +1,294 @@
+================================================================================
+FAIERS — EMERGENCY REQUEST SERVICE SPECIFICATION & API DOCUMENTATION
+Module Name: emergency-request-service
+Default Port: 8081
+================================================================================
+
+1. TECHNICAL OVERVIEW & RESPONSIBILITY
+--------------------------------------------------------------------------------
+The Emergency Request Service is the front-door ingestion engine of FAIERS (Fully
+Autonomous Intelligent Emergency Response System). It receives inbound emergency
+reports from automated AI voice agents (ElevenLabs/Exotel), human call operators,
+or external emergency APIs.
+
+Its primary responsibilities are:
+1. Authenticate external webhook calls and validate all payload fields.
+2. Generate unique tracking IDs for every incident (e.g., EMG-xxxx).
+3. Persist emergency incidents and their geographic coordinates into PostgreSQL.
+4. Manage emergency lifecycle state transitions (RECEIVED -> DISPATCH_PENDING ->
+   DISPATCHED -> COMPLETED / CANCELLED).
+5. Publish domain events (EmergencyRequestAcceptedEvent) to initiate automated
+   vehicle allocation in the Dispatch Service.
+
+Technology Stack:
+- Language: Java 17 / 21
+- Framework: Spring Boot 4.x / 3.x (Spring MVC, Spring Data JPA, Spring Validation)
+- Security: Spring Security (permissive default filter chain)
+- Database: PostgreSQL (table: emergency_requests)
+- Migrations: Flyway (via db-migrations module)
+- Monitoring: Spring Boot Actuator (/actuator/health)
+
+Layered Architecture:
+- Controller Layer: REST endpoints & Voice Agent Webhook handlers
+- Service Layer: Business logic, ID generation, validation & state transitions
+- DAO / Repository Layer: Data access abstraction over Spring Data JPA
+- Entity Layer: EmergencyRequestEntity mapped to PostgreSQL
+- Event Layer: ApplicationEventPublisher / Event contracts for dispatching
+- DTO Layer: Request & response schemas with Jakarta Bean Validation
+
+
+2. DATABASE SCHEMA & ENTITY DESIGN
+--------------------------------------------------------------------------------
+Table: emergency_requests
+Columns:
+- id                      VARCHAR(64) PRIMARY KEY
+- caller_id               VARCHAR(100)
+- emergency_type          VARCHAR(50) NOT NULL
+- severity                VARCHAR(50) NOT NULL
+- latitude                DOUBLE PRECISION NOT NULL
+- longitude               DOUBLE PRECISION NOT NULL
+- address                 VARCHAR(255)
+- landmark                VARCHAR(255)
+- description             TEXT
+- status                  VARCHAR(50) NOT NULL DEFAULT 'RECEIVED'
+- assigned_vehicle_id     VARCHAR(64)
+- assigned_assignment_id  VARCHAR(64)
+- created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+- updated_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+
+Indexes:
+- idx_emergency_requests_status (status)
+- idx_emergency_requests_created_at (created_at)
+
+
+3. DOMAIN ENUMS & LIFECYCLE STATES
+--------------------------------------------------------------------------------
+A. EmergencyType:
+   - MEDICAL: Cardiac arrest, trauma, unconsciousness, severe injury.
+   - FIRE: Residential, commercial, vehicular, or hazardous fire.
+   - ACCIDENT: Road traffic collisions, multi-vehicle pileups.
+   - POLICE: Robbery, armed incident, crowd control.
+   - NATURAL_DISASTER: Flooding, building collapse, earthquake.
+   - OTHER: Unclassified incident.
+
+B. Severity:
+   - CRITICAL: Life-threatening condition; requires immediate top-priority dispatch.
+   - HIGH: Urgent; severe injury or rapid deterioration risk.
+   - MEDIUM: Potentially serious; requires prompt response without sirens/lights.
+   - LOW: Non-life-threatening or non-urgent assistance.
+
+C. EmergencyStatus:
+   - RECEIVED: Initial record created from payload.
+   - VALIDATED: Coordinates and fields confirmed.
+   - DISPATCH_PENDING: Request accepted and awaiting vehicle allocation.
+   - DISPATCHED: Vehicle allocated and dispatch command transmitted.
+   - COMPLETED: Vehicle arrived, attended incident, and cleared assignment.
+   - CANCELLED: Caller cancelled or determined to be false alarm.
+
+
+4. COMPLETE REST API ENDPOINTS
+--------------------------------------------------------------------------------
+
+All responses follow the unified ApiResponse<T> envelope:
+{
+  "success": boolean,
+  "message": string,
+  "data": object | array | null,
+  "timestamp": "ISO-8601 UTC timestamp"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 1: Voice Agent Webhook (ElevenLabs / Exotel)
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/webhooks/voice-agent
+        (Aliases: POST /api/v1/webhooks/elevenlabs, POST /api/v1/webhooks/exotel)
+Header: Content-Type: application/json
+        X-Webhook-Secret: <optional webhook token>
+Description: Called by AI voice agents immediately after concluding an emergency call.
+
+Request Body:
+{
+  "callerId": "CALL-2048",
+  "emergencyType": "FIRE",
+  "severity": "CRITICAL",
+  "location": {
+    "latitude": 13.0674,
+    "longitude": 80.2376,
+    "address": "T. Nagar Commercial Complex",
+    "landmark": "Near Bus Stand"
+  },
+  "description": "Building floor 3 on fire, multiple people trapped"
+}
+
+Response (201 Created):
+{
+  "success": true,
+  "message": "Voice agent webhook received and emergency dispatched",
+  "data": {
+    "id": "EMG-51283848",
+    "callerId": "CALL-2048",
+    "emergencyType": "FIRE",
+    "severity": "CRITICAL",
+    "status": "DISPATCH_PENDING",
+    "location": {
+      "latitude": 13.0674,
+      "longitude": 80.2376,
+      "address": "T. Nagar Commercial Complex",
+      "landmark": "Near Bus Stand"
+    },
+    "description": "Building floor 3 on fire, multiple people trapped",
+    "assignedVehicleId": null,
+    "assignedAssignmentId": null,
+    "createdAt": "2026-10-26T10:37:31.286Z",
+    "updatedAt": "2026-10-26T10:37:31.286Z"
+  },
+  "timestamp": "2026-10-26T10:37:31.294Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 2: Create Emergency Request (Standard REST API)
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/emergency-requests
+Header: Content-Type: application/json
+Description: Ingests an emergency request from web portals, mobile apps, or operators.
+
+Request Body:
+{
+  "callerId": "CALL-1024",
+  "emergencyType": "MEDICAL",
+  "severity": "HIGH",
+  "location": {
+    "latitude": 13.0827,
+    "longitude": 80.2707,
+    "address": "Chennai Central Railway Station",
+    "landmark": "Gate 2 Taxi Stand"
+  },
+  "description": "Passenger having acute breathing difficulty and chest pain"
+}
+
+Response (201 Created):
+Same ApiResponse structure as Webhook, returning generated EMG-xxxx.
+
+--------------------------------------------------------------------------------
+ENDPOINT 3: Get Emergency Request by ID
+--------------------------------------------------------------------------------
+Path:   GET /api/v1/emergency-requests/{id}
+Description: Fetches full emergency details and assignment state by ID.
+Example: GET /api/v1/emergency-requests/EMG-51283848
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Operation successful",
+  "data": {
+    "id": "EMG-51283848",
+    "callerId": "CALL-2048",
+    "emergencyType": "FIRE",
+    "severity": "CRITICAL",
+    "status": "DISPATCH_PENDING",
+    "location": {
+      "latitude": 13.0674,
+      "longitude": 80.2376,
+      "address": "T. Nagar Commercial Complex",
+      "landmark": "Near Bus Stand"
+    },
+    "description": "Building floor 3 on fire, multiple people trapped",
+    "assignedVehicleId": null,
+    "assignedAssignmentId": null,
+    "createdAt": "2026-10-26T10:37:31.286Z",
+    "updatedAt": "2026-10-26T10:37:31.286Z"
+  },
+  "timestamp": "2026-10-26T10:38:00.000Z"
+}
+Response (404 Not Found):
+{
+  "success": false,
+  "message": "Emergency request not found with ID: EMG-9999",
+  "data": null,
+  "timestamp": "2026-10-26T10:38:00.000Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 4: List All Emergency Requests (With Filtering)
+--------------------------------------------------------------------------------
+Path:   GET /api/v1/emergency-requests
+Params: status (optional, e.g. DISPATCH_PENDING, DISPATCHED, COMPLETED, CANCELLED)
+        severity (optional, e.g. CRITICAL, HIGH, MEDIUM, LOW)
+Description: Retrieves a list of emergency requests ordered by newest first.
+Examples:
+  - GET /api/v1/emergency-requests
+  - GET /api/v1/emergency-requests?status=DISPATCH_PENDING
+  - GET /api/v1/emergency-requests?severity=CRITICAL
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Operation successful",
+  "data": [
+    { "id": "EMG-51283848", "emergencyType": "FIRE", "status": "DISPATCH_PENDING", ... },
+    { "id": "EMG-20309995", "emergencyType": "MEDICAL", "status": "DISPATCH_PENDING", ... }
+  ],
+  "timestamp": "2026-10-26T10:38:00.000Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 5: Update Emergency Status
+--------------------------------------------------------------------------------
+Path:   PATCH /api/v1/emergency-requests/{id}/status
+Header: Content-Type: application/json
+Description: Called by Dispatch Service to link assigned vehicle or advance status.
+
+Request Body:
+{
+  "status": "DISPATCHED",
+  "vehicleId": "AMB-042",
+  "assignmentId": "ASN-2001",
+  "remarks": "ALS Ambulance dispatched"
+}
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Emergency status updated successfully",
+  "data": {
+    "id": "EMG-20309995",
+    "status": "DISPATCHED",
+    "assignedVehicleId": "AMB-042",
+    "assignedAssignmentId": "ASN-2001",
+    ...
+  },
+  "timestamp": "2026-10-26T10:39:00.000Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 6: Cancel Emergency Request
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/emergency-requests/{id}/cancel?reason=Caller+Cancelled
+Description: Cancels an active emergency request. Prevents cancellation if already COMPLETED.
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Emergency request cancelled",
+  "data": {
+    "id": "EMG-20309995",
+    "status": "CANCELLED",
+    "description": "Passenger having severe chest pain [CANCELLED: Caller Cancelled]",
+    ...
+  },
+  "timestamp": "2026-10-26T10:40:00.000Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 7: Health & Monitoring Endpoint
+--------------------------------------------------------------------------------
+Path:   GET /actuator/health
+Description: Verifies service liveness, readiness, and PostgreSQL connectivity.
+Response (200 OK):
+{
+  "status": "UP",
+  "components": {
+    "db": { "status": "UP", "details": { "database": "PostgreSQL" } },
+    "diskSpace": { "status": "UP" }
+  }
+}

@@ -1,0 +1,9 @@
+target/classes
+target/generated-sources
+target/maven-status
+target/surefire-reports
+target/*.original
+.idea
+.git
+*.iml
+*.log

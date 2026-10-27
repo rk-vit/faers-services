@@ -1,0 +1,84 @@
+================================================================================
+FAIERS — CENTRAL DATABASE MIGRATIONS SPECIFICATION
+Module Name: db-migrations
+================================================================================
+
+1. TECHNICAL OVERVIEW & RESPONSIBILITY
+--------------------------------------------------------------------------------
+The db-migrations module is the centralized database version control hub for the
+entire FAIERS microservices architecture. It ensures reproducible, zero-downtime,
+and audit-trailed database schema changes across local developer machines, staging,
+and production Amazon RDS PostgreSQL instances.
+
+Its primary responsibilities are:
+1. Versioned SQL Migrations: Enforce linear schema progression using Flyway versioning
+   naming conventions (V1__..., V2__..., etc.).
+2. Microservice Table Ownership: Provide clearly separated DDL for each microservice's
+   data domain while allowing all services to point to a consolidated PostgreSQL
+   database in early stages without cross-table corruption.
+3. Multiple Execution Models:
+   - Automated Application Startup: When any microservice starts, Flyway automatically
+     checks and executes pending migrations from the db-migrations classpath dependency.
+   - CLI / Maven Command: Developers and CI/CD pipelines can migrate the DB directly
+     without starting application services:
+     `mvn -pl db-migrations flyway:migrate`
+   - Rollback / Validation: Flyway validates checksums on startup to guarantee that no
+     previously applied migration script has been tampered with.
+
+Technology Stack:
+- Flyway Core (12.x)
+- Flyway PostgreSQL Database Extension (flyway-database-postgresql)
+- PostgreSQL JDBC Driver (42.7.x)
+- Flyway Maven Plugin
+
+
+2. MIGRATION FILES ROADMAP & STRUCTURE
+--------------------------------------------------------------------------------
+
+Location: db-migrations/src/main/resources/db/migration/
+
+- V1__create_emergency_requests_table.sql (APPLIED):
+  Creates `emergency_requests` table with indexes on `status` and `created_at`.
+  Owned by: `emergency-request-service`
+
+- V2__create_fleet_and_dispatch_tables.sql (READY FOR DISPATCH SERVICE):
+  Creates `vehicles` (fleet registry with lat/lon, status, capabilities) and
+  `dispatch_assignments` (linking emergencies with allocated vehicles).
+  Owned by: `dispatch-service`
+
+- V3__create_vehicle_commands_table.sql (READY FOR VEHICLE COMMAND SERVICE):
+  Creates `vehicle_commands` and acknowledgment tracking tables.
+  Owned by: `vehicle-command-service`
+
+- V4__create_traffic_and_tracking_tables.sql (READY FOR TRACKING SERVICE):
+  Creates `traffic_intersections`, `green_corridor_requests`, and `gps_breadcrumbs`.
+  Owned by: `vehicle-tracking-service`
+
+
+3. CONFIGURATION & DATABASE ACCESS
+--------------------------------------------------------------------------------
+Default Connection Settings (Local):
+- Host: localhost
+- Port: 5432
+- Database: faers-db
+- Username: postgres
+- Password: postgres
+- JDBC URL: jdbc:postgresql://localhost:5432/faers-db
+
+Environment Variable Overrides (Production / ECS):
+- SPRING_DATASOURCE_URL
+- SPRING_DATASOURCE_USERNAME
+- SPRING_DATASOURCE_PASSWORD
+
+
+4. HOW TO RUN MIGRATIONS
+--------------------------------------------------------------------------------
+
+A. Run Migrations via Maven (Standalone):
+   mvn -pl db-migrations flyway:migrate
+
+B. Check Migration History / Status:
+   docker exec -it faers-db psql -U postgres -d faers-db -c "SELECT installed_rank, version, description, type, execution_time, success FROM flyway_schema_history;"
+
+C. Repair Checksums (If ever modified during dev):
+   mvn -pl db-migrations flyway:repair

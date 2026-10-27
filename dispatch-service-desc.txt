@@ -1,0 +1,264 @@
+================================================================================
+FAIERS — DISPATCH SERVICE SPECIFICATION & API DOCUMENTATION
+Module Name: dispatch-service
+Default Port: 8082
+================================================================================
+
+1. TECHNICAL OVERVIEW & RESPONSIBILITY
+--------------------------------------------------------------------------------
+The Dispatch Service is the algorithmic decision-making brain of FAIERS. Its mission
+is to match incoming emergency incidents with the most suitable, closest, and currently
+available emergency vehicles in a strictly concurrency-safe manner.
+
+Its primary responsibilities are:
+1. Fleet Registry Management: Track emergency vehicles (ambulances, fire tenders,
+   police patrol units), their equipment tier (BLS, ALS, HazMat), and status.
+2. Geospatial Proximity & Suitability Matching: Filter candidate vehicles based on:
+   - Vehicle type matching the incident (e.g. ALS ambulance for CRITICAL medical).
+   - Operational status (ACTIVE).
+   - Real-time availability (AVAILABLE).
+   - Geographic distance / road-network ETA to incident coordinates.
+3. Concurrency-Safe Vehicle Allocation:
+   - CRITICAL REQUIREMENT: If multiple emergency requests arrive at the exact same
+     millisecond, the service uses database-level pessimistic locking
+     (@Lock(LockModeType.PESSIMISTIC_WRITE) / SELECT ... FOR UPDATE) to guarantee
+     that no vehicle is ever double-allocated to two emergencies.
+4. Assignment Lifecycle Management:
+   - Create dispatch assignment record (ASN-xxxx).
+   - Reserve vehicle (mark vehicle status as RESERVED / DISPATCHED).
+   - Transmit dispatch command to Vehicle Command Service.
+   - Handle unallocated incidents (e.g. queueing and retrying if all fleet is busy).
+5. Inter-service Synchronization:
+   - Notify Emergency Request Service when vehicle is assigned (updating its status).
+   - Notify Vehicle Tracking Service to initiate route calculation and green corridor.
+
+Technology Stack:
+- Language: Java 17 / 21
+- Framework: Spring Boot, Spring Data JPA, Spring Validation
+- Database: PostgreSQL (tables: vehicles, dispatch_assignments)
+- Concurrency Control: DB Pessimistic Locking & Transaction Isolation
+- Proximity Engine: Haversine distance & road-network ETA algorithm
+
+
+2. DATABASE SCHEMA DESIGN
+--------------------------------------------------------------------------------
+
+Table: vehicles
+- id                      VARCHAR(64) PRIMARY KEY  (e.g., AMB-101)
+- vehicle_type            VARCHAR(50) NOT NULL     (AMBULANCE, FIRE_TENDER, POLICE)
+- capability_tier         VARCHAR(50) NOT NULL     (BLS, ALS, HAZMAT, RESCUE)
+- license_plate           VARCHAR(50) NOT NULL UNIQUE
+- status                  VARCHAR(50) NOT NULL     (AVAILABLE, RESERVED, DISPATCHED, ON_SCENE, MAINTENANCE)
+- current_latitude        DOUBLE PRECISION NOT NULL
+- current_longitude       DOUBLE PRECISION NOT NULL
+- base_station_id         VARCHAR(64)
+- updated_at              TIMESTAMP WITH TIME ZONE NOT NULL
+
+Table: dispatch_assignments
+- id                      VARCHAR(64) PRIMARY KEY  (e.g., ASN-2001)
+- emergency_request_id    VARCHAR(64) NOT NULL     (e.g., EMG-1001)
+- vehicle_id              VARCHAR(64) NOT NULL REFERENCES vehicles(id)
+- status                  VARCHAR(50) NOT NULL     (ASSIGNED, ACCEPTED, ON_ROUTE, ARRIVED, CLEARED, FAILED)
+- estimated_distance_km   DOUBLE PRECISION
+- estimated_eta_seconds   INTEGER
+- assigned_at             TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+- completed_at            TIMESTAMP WITH TIME ZONE
+- failure_reason          TEXT
+
+Indexes:
+- idx_vehicles_status_type (status, vehicle_type)
+- idx_dispatch_assignments_emergency (emergency_request_id)
+- idx_dispatch_assignments_vehicle (vehicle_id)
+
+
+3. DOMAIN ENUMS
+--------------------------------------------------------------------------------
+A. VehicleType:
+   - AMBULANCE: Medical emergency response.
+   - FIRE_TENDER: Structural and vehicular fires.
+   - POLICE: Crime, perimeter securing, traffic control.
+   - RESCUE_UNIT: Specialized disaster response.
+
+B. CapabilityTier:
+   - ALS (Advanced Life Support): Ventilators, cardiac monitors, defibrillators.
+   - BLS (Basic Life Support): Oxygen, first aid, splints.
+   - HAZMAT: Chemical and hazardous material containment.
+   - HEAVY_RESCUE: Hydraulic cutters, structural lifting gear.
+
+C. VehicleAvailabilityStatus:
+   - AVAILABLE: Idle at station or returning to base; ready for dispatch.
+   - RESERVED: Locked by dispatch engine; awaiting vehicle command ACK.
+   - DISPATCHED: Acknowledged by vehicle; actively navigating to incident.
+   - ON_SCENE: Arrived at emergency site.
+   - RETURNING: Mission completed; navigating back to base station.
+   - OUT_OF_SERVICE: Maintenance, refueling, or off-duty.
+
+D. AssignmentStatus:
+   - ASSIGNED: Vehicle matched and locked; command dispatched.
+   - ACCEPTED: Onboard Unit acknowledged dispatch.
+   - ON_ROUTE: En route to destination.
+   - ARRIVED: Arrived at emergency coordinates.
+   - CLEARED: Mission accomplished; vehicle returned to AVAILABLE.
+   - FAILED: Command rejected, timed out, or vehicle broke down.
+
+
+4. COMPLETE REST API ENDPOINTS
+--------------------------------------------------------------------------------
+
+All responses follow the unified ApiResponse<T> envelope.
+
+--------------------------------------------------------------------------------
+ENDPOINT 1: Trigger Emergency Vehicle Allocation (Auto-Dispatch)
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/dispatch/allocate
+Header: Content-Type: application/json
+Description: Consumes an accepted emergency request, finds the optimal vehicle,
+             locks it with a database write lock, and initiates the assignment.
+
+Request Body:
+{
+  "emergencyRequestId": "EMG-20309995",
+  "emergencyType": "MEDICAL",
+  "severity": "CRITICAL",
+  "destination": {
+    "latitude": 13.0827,
+    "longitude": 80.2707
+  }
+}
+
+Response (201 Created — Vehicle Assigned):
+{
+  "success": true,
+  "message": "Vehicle AMB-042 successfully allocated and locked for emergency EMG-20309995",
+  "data": {
+    "assignmentId": "ASN-2001",
+    "emergencyRequestId": "EMG-20309995",
+    "vehicleId": "AMB-042",
+    "vehicleType": "AMBULANCE",
+    "capabilityTier": "ALS",
+    "status": "ASSIGNED",
+    "estimatedDistanceKm": 2.45,
+    "estimatedEtaSeconds": 240,
+    "assignedAt": "2026-10-26T10:45:00.000Z"
+  },
+  "timestamp": "2026-10-26T10:45:00.050Z"
+}
+
+Response (409 Conflict / 202 Accepted — Fleet Exhaustion / Queued):
+{
+  "success": false,
+  "message": "No suitable vehicles currently available within operational radius. Incident placed in high-priority dispatch queue.",
+  "data": {
+    "emergencyRequestId": "EMG-20309995",
+    "queuePosition": 1,
+    "status": "QUEUED"
+  },
+  "timestamp": "2026-10-26T10:45:00.050Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 2: Register a New Vehicle into Fleet
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/vehicles
+Header: Content-Type: application/json
+Description: Onboards a new emergency response vehicle into the fleet database.
+
+Request Body:
+{
+  "id": "AMB-042",
+  "vehicleType": "AMBULANCE",
+  "capabilityTier": "ALS",
+  "licensePlate": "TN-01-EM-4200",
+  "baseStationId": "STATION-CENTRAL",
+  "initialLocation": {
+    "latitude": 13.0750,
+    "longitude": 80.2600
+  }
+}
+
+Response (201 Created):
+{
+  "success": true,
+  "message": "Vehicle registered successfully",
+  "data": {
+    "id": "AMB-042",
+    "vehicleType": "AMBULANCE",
+    "capabilityTier": "ALS",
+    "licensePlate": "TN-01-EM-4200",
+    "status": "AVAILABLE",
+    "currentLocation": { "latitude": 13.0750, "longitude": 80.2600 }
+  },
+  "timestamp": "2026-10-26T10:46:00.000Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 3: List Fleet Vehicles (With Filtering)
+--------------------------------------------------------------------------------
+Path:   GET /api/v1/vehicles
+Params: status (optional: AVAILABLE, RESERVED, DISPATCHED, ON_SCENE, OUT_OF_SERVICE)
+        vehicleType (optional: AMBULANCE, FIRE_TENDER, POLICE)
+Description: Returns current status and latest coordinates of fleet vehicles.
+Example: GET /api/v1/vehicles?status=AVAILABLE&vehicleType=AMBULANCE
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Operation successful",
+  "data": [
+    {
+      "id": "AMB-042",
+      "vehicleType": "AMBULANCE",
+      "capabilityTier": "ALS",
+      "status": "AVAILABLE",
+      "currentLatitude": 13.0750,
+      "currentLongitude": 80.2600,
+      "updatedAt": "2026-10-26T10:44:00.000Z"
+    }
+  ],
+  "timestamp": "2026-10-26T10:46:30.000Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 4: Get Assignment by ID
+--------------------------------------------------------------------------------
+Path:   GET /api/v1/dispatch/assignments/{assignmentId}
+Description: Retrieves assignment details, assigned vehicle, ETA, and status.
+Example: GET /api/v1/dispatch/assignments/ASN-2001
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "assignmentId": "ASN-2001",
+    "emergencyRequestId": "EMG-20309995",
+    "vehicleId": "AMB-042",
+    "status": "ON_ROUTE",
+    "estimatedDistanceKm": 2.45,
+    "estimatedEtaSeconds": 240,
+    "assignedAt": "2026-10-26T10:45:00.000Z"
+  }
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 5: Complete / Clear Assignment
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/dispatch/assignments/{assignmentId}/complete
+Description: Marks mission as finished, returns the vehicle to AVAILABLE,
+             and notifies Emergency Request and Tracking services.
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Assignment ASN-2001 completed. Vehicle AMB-042 is now AVAILABLE.",
+  "data": {
+    "assignmentId": "ASN-2001",
+    "status": "CLEARED",
+    "completedAt": "2026-10-26T11:15:00.000Z"
+  }
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 6: Health Endpoint
+--------------------------------------------------------------------------------
+Path:   GET /actuator/health
+Response (200 OK): Standard Spring Boot health output confirming DB connection.

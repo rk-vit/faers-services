@@ -1,0 +1,225 @@
+================================================================================
+FAIERS — VEHICLE COMMAND SERVICE SPECIFICATION & API DOCUMENTATION
+Module Name: vehicle-command-service
+Default Port: 8083
+================================================================================
+
+1. TECHNICAL OVERVIEW & RESPONSIBILITY
+--------------------------------------------------------------------------------
+The Vehicle Command Service acts as the mission-critical communications gateway
+between the FAIERS backend and the physical/simulated Onboard Vehicle Units (OBUs)
+installed in ambulances, fire tenders, and police cars.
+
+Sending a command does NOT assume that the vehicle has received or accepted it.
+The vehicle's onboard device must explicitly acknowledge (ACK) and accept the command.
+
+Its primary responsibilities are:
+1. Command Generation: Receive assignment instructions from the Dispatch Service and
+   construct operational dispatch orders (CMD-xxxx).
+2. Two-Way Device Interface: Provide authenticated HTTP/REST endpoints (and future
+   MQTT channels) for Onboard Vehicle Units to receive orders and transmit receipts.
+3. Delivery & Acknowledgment State Machine: Track each command through:
+   PENDING -> SENT -> ACKNOWLEDGED / ACCEPTED / REJECTED / TIMED_OUT / FAILED.
+4. Resilience & Retry Engine:
+   - Configurable retry interval (e.g. 3 attempts every 5 seconds).
+   - If an OBU fails to acknowledge within the deadline (e.g. 15 seconds), mark
+     the command as TIMED_OUT and report the failure back to the Dispatch Service
+     so it can immediately failover and reallocate another emergency vehicle.
+5. Built-in OBU Simulator:
+   - Ships with an embedded vehicle unit simulator allowing full end-to-end testing,
+     automated CI/CD pipelines, and demos without physical vehicle hardware.
+
+Technology Stack:
+- Language: Java 17 / 21
+- Framework: Spring Boot, Spring Web, Spring Data JPA, Spring Scheduling
+- Database: PostgreSQL (table: vehicle_commands)
+- Device Security: Authenticated Bearer tokens / device API keys
+- Simulation Engine: Configurable automatic or manual OBU response generator
+
+
+2. DATABASE SCHEMA DESIGN
+--------------------------------------------------------------------------------
+
+Table: vehicle_commands
+- id                      VARCHAR(64) PRIMARY KEY  (e.g., CMD-5001)
+- assignment_id           VARCHAR(64) NOT NULL     (e.g., ASN-2001)
+- emergency_request_id    VARCHAR(64) NOT NULL     (e.g., EMG-20309995)
+- vehicle_id              VARCHAR(64) NOT NULL     (e.g., AMB-042)
+- command_type            VARCHAR(50) NOT NULL     (DISPATCH, REROUTE, CANCEL, STANDBY)
+- destination_latitude    DOUBLE PRECISION NOT NULL
+- destination_longitude   DOUBLE PRECISION NOT NULL
+- status                  VARCHAR(50) NOT NULL     (PENDING, SENT, ACKNOWLEDGED, REJECTED, TIMED_OUT)
+- retry_count             INTEGER NOT NULL DEFAULT 0
+- max_retries             INTEGER NOT NULL DEFAULT 3
+- dispatched_at           TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+- acknowledged_at         TIMESTAMP WITH TIME ZONE
+- rejection_reason        VARCHAR(255)
+
+Indexes:
+- idx_vehicle_commands_vehicle (vehicle_id, status)
+- idx_vehicle_commands_assignment (assignment_id)
+
+
+3. COMMAND LIFECYCLE STATES
+--------------------------------------------------------------------------------
+- PENDING: Command registered in backend, queued for transmission to vehicle.
+- SENT: Transmitted to OBU or retrieved by vehicle's polling request.
+- ACKNOWLEDGED: OBU confirmed reception, driver accepted route, emergency mode engaged.
+- REJECTED: Driver or vehicle computer rejected (e.g. mechanical failure, flat tire).
+- TIMED_OUT: OBU failed to respond within timeout window (e.g. 15 seconds).
+- CANCELLED: Mission aborted by dispatch before vehicle accepted.
+
+
+4. COMPLETE REST API ENDPOINTS
+--------------------------------------------------------------------------------
+
+All responses follow the unified ApiResponse<T> envelope.
+
+--------------------------------------------------------------------------------
+ENDPOINT 1: Issue Dispatch Command (Called by Dispatch Service)
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/commands
+Header: Content-Type: application/json
+Description: Creates a dispatch command for a specific vehicle and assignment.
+
+Request Body:
+{
+  "assignmentId": "ASN-2001",
+  "emergencyRequestId": "EMG-20309995",
+  "vehicleId": "AMB-042",
+  "commandType": "DISPATCH",
+  "destination": {
+    "latitude": 13.0827,
+    "longitude": 80.2707,
+    "address": "Chennai Central Railway Station"
+  },
+  "instructions": "Priority 1 Medical Emergency — Oxygen & ALS preparation required"
+}
+
+Response (201 Created):
+{
+  "success": true,
+  "message": "Dispatch command CMD-5001 issued for vehicle AMB-042",
+  "data": {
+    "commandId": "CMD-5001",
+    "assignmentId": "ASN-2001",
+    "vehicleId": "AMB-042",
+    "commandType": "DISPATCH",
+    "status": "PENDING",
+    "destination": {
+      "latitude": 13.0827,
+      "longitude": 80.2707
+    },
+    "dispatchedAt": "2026-10-26T10:45:05.000Z"
+  },
+  "timestamp": "2026-10-26T10:45:05.010Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 2: Onboard Vehicle Unit (OBU) Fetch Pending Commands
+--------------------------------------------------------------------------------
+Path:   GET /api/v1/device/{vehicleId}/commands/pending
+Header: X-Device-Token: <vehicle-obu-auth-token>
+Description: Called periodically by the vehicle's onboard computer to check for
+             new dispatch orders.
+
+Response (200 OK — When command exists):
+{
+  "success": true,
+  "message": "Pending command retrieved",
+  "data": {
+    "commandId": "CMD-5001",
+    "commandType": "DISPATCH",
+    "emergencyRequestId": "EMG-20309995",
+    "assignmentId": "ASN-2001",
+    "destination": {
+      "latitude": 13.0827,
+      "longitude": 80.2707,
+      "address": "Chennai Central Railway Station"
+    },
+    "instructions": "Priority 1 Medical Emergency — Oxygen & ALS preparation required",
+    "timeoutSeconds": 15
+  }
+}
+
+Response (200 OK — No pending orders):
+{
+  "success": true,
+  "message": "No pending commands",
+  "data": null
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 3: Onboard Vehicle Unit (OBU) Acknowledge / Accept Command
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/device/{vehicleId}/commands/{commandId}/ack
+Header: Content-Type: application/json
+        X-Device-Token: <vehicle-obu-auth-token>
+Description: Called by the vehicle's OBU when the driver accepts the dispatch or
+             the vehicle computer confirms activation of emergency lights/sirens.
+
+Request Body (Acceptance):
+{
+  "action": "ACCEPT",
+  "onboardGps": {
+    "latitude": 13.0750,
+    "longitude": 80.2600
+  },
+  "remarks": "Driver accepted. Sirens engaged. Moving to target."
+}
+
+Request Body (Rejection):
+{
+  "action": "REJECT",
+  "rejectionReason": "Vehicle engine failure - coolant overheating"
+}
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Command CMD-5001 acknowledged: ACCEPTED",
+  "data": {
+    "commandId": "CMD-5001",
+    "status": "ACKNOWLEDGED",
+    "acknowledgedAt": "2026-10-26T10:45:12.000Z"
+  }
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 4: Get Command Status
+--------------------------------------------------------------------------------
+Path:   GET /api/v1/commands/{commandId}
+Description: Used by Dispatch Service or operator dashboards to monitor delivery status.
+Example: GET /api/v1/commands/CMD-5001
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "commandId": "CMD-5001",
+    "assignmentId": "ASN-2001",
+    "vehicleId": "AMB-042",
+    "status": "ACKNOWLEDGED",
+    "retryCount": 0,
+    "dispatchedAt": "2026-10-26T10:45:05.000Z",
+    "acknowledgedAt": "2026-10-26T10:45:12.000Z"
+  }
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 5: Built-in OBU Simulator Trigger (For Automated Testing)
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/simulation/obu/auto-ack?enabled=true
+Description: Enables simulated vehicles to automatically acknowledge incoming
+             dispatch commands within 500ms, enabling seamless automated testing.
+Response (200 OK):
+{
+  "success": true,
+  "message": "OBU Simulator configured: Auto-ACK = true"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 6: Health Endpoint
+--------------------------------------------------------------------------------
+Path:   GET /actuator/health
+Response (200 OK): Standard health report confirming database and scheduler status.

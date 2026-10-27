@@ -1,0 +1,253 @@
+================================================================================
+FAIERS — VEHICLE TRACKING & GREEN CORRIDOR SERVICE SPECIFICATION
+Module Name: vehicle-tracking-service
+Default Port: 8084
+================================================================================
+
+1. TECHNICAL OVERVIEW & RESPONSIBILITY
+--------------------------------------------------------------------------------
+The Vehicle Tracking & Green Corridor Service combines high-throughput real-time GPS
+telemetry processing with intelligent road-route navigation and automated traffic signal
+priority coordination (Green Wave).
+
+Safety Rule: The service does NOT blindly force traffic lights to change. Instead, it
+sends authorized signal-priority requests to smart traffic controllers, which evaluate
+safety constraints (pedestrian clearance, minimum green time, conflicting traffic)
+and return official phase confirmations.
+
+Its primary responsibilities are:
+
+A. Live Vehicle GPS Tracking:
+   - Ingest continuous GPS telemetry streams from active emergency vehicles (lat, lon,
+     speed, heading, altitude, timestamp).
+   - Validate breadcrumbs against speed plausibility and reject stale/corrupted packets.
+   - Maintain the authoritative "Latest Known Location" state cache.
+
+B. Dynamic Route & ETA Engine:
+   - Calculate road-network path between vehicle's current position and destination.
+   - Project real-time ETA based on distance and emergency vehicle velocity.
+   - Detect route deviations (if the driver takes an alternate street) and trigger
+     automatic route recalculation.
+   - Identify upcoming traffic intersections mapped along the active route.
+
+C. Green Corridor Coordination:
+   - Continuously evaluate the vehicle's ETA to upcoming traffic signal controllers.
+   - When vehicle approaches an intersection within the activation window (e.g. ETA < 60s),
+     issue an authenticated signal-priority request to that specific intersection controller.
+   - Monitor controller acknowledgment and phase transition (switching conflicting lights
+     to red and granting green wave along the vehicle's path).
+   - Safely release signal priority the moment GPS coordinates indicate the vehicle has
+     passed the intersection, returning the traffic light to its normal cyclical schedule.
+   - Immediately terminate corridor priority if an emergency assignment is cancelled.
+
+D. Built-in Traffic Signal Controller Simulator:
+   - Includes virtual traffic signal controllers along municipal test corridors with
+     phase switching and safety delay models for instant local testing.
+
+Technology Stack:
+- Language: Java 17 / 21
+- Framework: Spring Boot, Spring Web, Spring Data JPA, Spring Scheduling
+- Database: PostgreSQL (tables: gps_breadcrumbs, intersections, green_corridor_logs)
+- Spatial Math: Haversine distance, polygon corridor buffers & heading calculations
+- Caching: In-memory concurrent maps / Redis for zero-latency live coordinate access
+
+
+2. DATABASE SCHEMA DESIGN
+--------------------------------------------------------------------------------
+
+Table: traffic_intersections
+- id                      VARCHAR(64) PRIMARY KEY  (e.g., INT-CH-101)
+- name                    VARCHAR(100) NOT NULL    (e.g., Central Station Junction)
+- latitude                DOUBLE PRECISION NOT NULL
+- longitude               DOUBLE PRECISION NOT NULL
+- controller_ip           VARCHAR(100)
+- controller_protocol     VARCHAR(50) DEFAULT 'REST' (REST, NTCIP, MQTT)
+- current_state           VARCHAR(50) NOT NULL     (NORMAL_CYCLE, EMERGENCY_PRIORITY, FAULT)
+- min_green_seconds       INTEGER NOT NULL DEFAULT 10
+- clearance_delay_seconds INTEGER NOT NULL DEFAULT 4
+
+Table: green_corridor_requests
+- id                      VARCHAR(64) PRIMARY KEY  (e.g., GC-9001)
+- assignment_id           VARCHAR(64) NOT NULL
+- vehicle_id              VARCHAR(64) NOT NULL
+- intersection_id         VARCHAR(64) NOT NULL REFERENCES traffic_intersections(id)
+- status                  VARCHAR(50) NOT NULL     (REQUESTED, GRANTED, ACTIVE, PASSED, RELEASED, REJECTED)
+- approach_eta_seconds    INTEGER NOT NULL
+- requested_at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+- granted_at              TIMESTAMP WITH TIME ZONE
+- released_at             TIMESTAMP WITH TIME ZONE
+
+Table: gps_breadcrumbs
+- id                      BIGSERIAL PRIMARY KEY
+- vehicle_id              VARCHAR(64) NOT NULL
+- assignment_id           VARCHAR(64) NOT NULL
+- latitude                DOUBLE PRECISION NOT NULL
+- longitude               DOUBLE PRECISION NOT NULL
+- speed_kmh               DOUBLE PRECISION NOT NULL
+- heading_degrees         DOUBLE PRECISION
+- recorded_at             TIMESTAMP WITH TIME ZONE NOT NULL
+
+
+3. GREEN CORRIDOR LIFECYCLE STATES
+--------------------------------------------------------------------------------
+- REQUESTED: Approaching vehicle detected within 60s window; priority request sent to controller.
+- GRANTED: Traffic controller validated pedestrian clearance and approved priority.
+- ACTIVE: Signal transitioned to GREEN for emergency direction; conflicting phases locked RED.
+- PASSED: Vehicle's GPS crossed the intersection boundary.
+- RELEASED: Priority released; intersection safely resumed regular traffic cycle.
+- REJECTED: Controller refused priority (e.g., conflicting priority already held by another vehicle).
+
+
+4. COMPLETE REST API ENDPOINTS
+--------------------------------------------------------------------------------
+
+All responses follow the unified ApiResponse<T> envelope.
+
+--------------------------------------------------------------------------------
+ENDPOINT 1: Live GPS Telemetry Ingestion (High-Frequency Endpoint)
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/tracking/gps
+Header: Content-Type: application/json
+Description: Called by emergency vehicle's OBU every 1 to 3 seconds to report live telemetry.
+
+Request Body:
+{
+  "vehicleId": "AMB-042",
+  "assignmentId": "ASN-2001",
+  "latitude": 13.0785,
+  "longitude": 80.2650,
+  "speedKmh": 58.5,
+  "headingDegrees": 45.2,
+  "timestamp": "2026-10-26T10:48:00.000Z"
+}
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "GPS update processed",
+  "data": {
+    "vehicleId": "AMB-042",
+    "assignmentId": "ASN-2001",
+    "currentLocation": { "latitude": 13.0785, "longitude": 80.2650 },
+    "speedKmh": 58.5,
+    "remainingDistanceKm": 1.2,
+    "remainingEtaSeconds": 95,
+    "upcomingIntersection": {
+      "id": "INT-CH-101",
+      "name": "Central Station Junction",
+      "etaSeconds": 42,
+      "priorityStatus": "REQUESTED"
+    }
+  },
+  "timestamp": "2026-10-26T10:48:00.025Z"
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 2: Get Live Vehicle Status & Route Tracking
+--------------------------------------------------------------------------------
+Path:   GET /api/v1/tracking/vehicles/{vehicleId}
+Description: Returns the latest live coordinates, current speed, route progress, and ETA.
+Example: GET /api/v1/tracking/vehicles/AMB-042
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "vehicleId": "AMB-042",
+    "assignmentId": "ASN-2001",
+    "latitude": 13.0785,
+    "longitude": 80.2650,
+    "speedKmh": 58.5,
+    "heading": 45.2,
+    "lastPingAt": "2026-10-26T10:48:00.000Z",
+    "etaSeconds": 95,
+    "distanceRemainingMeters": 1200
+  }
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 3: Get Active Green Corridor Status
+--------------------------------------------------------------------------------
+Path:   GET /api/v1/tracking/corridors/{assignmentId}
+Description: Returns the status of all traffic signal controllers along the active route.
+Example: GET /api/v1/tracking/corridors/ASN-2001
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "assignmentId": "ASN-2001",
+    "vehicleId": "AMB-042",
+    "corridorStatus": "ACTIVE",
+    "intersections": [
+      {
+        "id": "INT-CH-101",
+        "name": "Central Station Junction",
+        "signalState": "GREEN_WAVE_ACTIVE",
+        "priorityStatus": "ACTIVE",
+        "distanceToIntersectionMeters": 350,
+        "etaSeconds": 28
+      },
+      {
+        "id": "INT-CH-102",
+        "name": "Rippon Building Crossing",
+        "signalState": "NORMAL_CYCLE",
+        "priorityStatus": "STANDBY",
+        "distanceToIntersectionMeters": 1100,
+        "etaSeconds": 85
+      }
+    ]
+  }
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 4: Traffic Signal Controller Priority Request (Internal Controller API)
+--------------------------------------------------------------------------------
+Path:   POST /api/v1/traffic-signals/{controllerId}/priority-request
+Header: Content-Type: application/json
+Description: Sent to compatible traffic controllers to request emergency green priority.
+
+Request Body:
+{
+  "vehicleId": "AMB-042",
+  "assignmentId": "ASN-2001",
+  "approachDirection": "NORTH_BOUND",
+  "etaSeconds": 45,
+  "vehicleSpeedKmh": 60.0
+}
+
+Response (200 OK — Priority Accepted):
+{
+  "success": true,
+  "message": "Signal priority approved. Transitioning to GREEN in 6 seconds.",
+  "data": {
+    "controllerId": "INT-CH-101",
+    "approved": true,
+    "scheduledGreenAt": "2026-10-26T10:48:30.000Z",
+    "clearanceTimeSeconds": 4
+  }
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 5: Traffic Signal Controller State Query (Simulator)
+--------------------------------------------------------------------------------
+Path:   GET /api/v1/traffic-signals/{controllerId}/state
+Description: Inspects the current state of a simulated or real traffic intersection.
+Example: GET /api/v1/traffic-signals/INT-CH-101/state
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "controllerId": "INT-CH-101",
+    "currentSignalPhase": "EMERGENCY_PRIORITY_GREEN",
+    "heldByVehicle": "AMB-042",
+    "normalCycleResumesInSeconds": null
+  }
+}
+
+--------------------------------------------------------------------------------
+ENDPOINT 6: Health Endpoint
+--------------------------------------------------------------------------------
+Path:   GET /actuator/health
+Response (200 OK): Confirms GPS telemetry engine, routing cache, and database connectivity.
