@@ -29,6 +29,7 @@
     <modules>
         <module>db-migrations</module>
         <module>emergency-request-service</module>
+        <module>dispatch-service</module>
     </modules>
 
     <dependencyManagement>
